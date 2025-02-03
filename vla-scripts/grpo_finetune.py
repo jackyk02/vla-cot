@@ -284,11 +284,12 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             output_ids, actions = get_batch_actions(
                 instruction=instruction,
                 image_path=image_path,
-                batch_size=1,
+                batch_size=batch_size,
                 temperature=0
             )
-            print(output_ids)
-            
+            all_action_preds = [torch.tensor([output_ids[i]], device=device_id) for i in range(len(output_ids))]
+            print(all_action_preds)
+
             # for _ in range(cfg.num_generations):
             #     with torch.autocast("cuda", dtype=torch.bfloat16):
             #         output: CausalLMOutputWithPast = vla(
@@ -319,8 +320,15 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                         pixel_values=inputs["pixel_values"].to(torch.bfloat16),
                         labels=inputs["labels"]
                     )
-                
+
                 logits = output.logits[:, model.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
+                logits = logits[:, -8:-1, :]
+                print(logits)
+                print(logits.shape)
+
+                action_preds = logits.argmax(dim=2)
+                print(action_preds)
+
                 log_probs = torch.log_softmax(logits, dim=-1)
                 
                 # Get the relevant action predictions for this batch
@@ -347,6 +355,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
 
             # Create completion mask based on action_gt
             action_gt = batch["labels"][:, 1:].to(action_preds.device)
+            action_gt = action_gt[:, -8:-1]
             mask = action_gt > action_tokenizer.action_token_begin_idx
             mask = mask.repeat(cfg.num_generations, 1)  # Repeat for all generations
 
