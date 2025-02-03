@@ -221,6 +221,9 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
     recent_rewards = deque(maxlen=cfg.grad_accumulation_steps)
     recent_kls = deque(maxlen=cfg.grad_accumulation_steps)
+    
+    # Make image directory
+    os.makedirs("images", exist_ok=True)
 
     # Training Loop
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -229,6 +232,9 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
         for batch_idx, batch in enumerate(dataloader):
             all_action_preds = []
             all_outputs = []
+
+            instruction = batch['lang']
+            batch['img'][0].save(f"images/observation.jpg") 
             
             for _ in range(cfg.num_generations):
                 with torch.autocast("cuda", dtype=torch.bfloat16):
