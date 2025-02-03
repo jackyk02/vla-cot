@@ -123,6 +123,23 @@ class GRPOVLAConfig:
 
     # fmt: on
 
+def save_lora_adapters(model, save_path):
+    import os
+    from peft import PeftModel
+    
+    # Ensure the model is a PeftModel
+    if not isinstance(model, PeftModel):
+        raise ValueError("Model must be a PeftModel with LoRA adapters")
+    
+    # Create the save directory if it doesn't exist
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Save only the adapter weights
+    model.save_pretrained(
+        save_path,
+        save_model=False,  # Don't save the base model
+        save_adapter=True  # Only save the LoRA adapter weights
+    )
 
 @draccus.wrap()
 def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
@@ -190,12 +207,12 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
         vla = vla.to(device_id)
 
     # Create reference model for KL divergence
-    ref_vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device_id)
+    # ref_vla = AutoModelForVision2Seq.from_pretrained(
+    #     cfg.vla_path,
+    #     torch_dtype=torch.bfloat16,
+    #     low_cpu_mem_usage=True,
+    #     trust_remote_code=True,
+    # ).to(device_id)
 
     # [LoRA] Wrap Model w/ PEFT `LoraConfig`
     if cfg.use_lora:
@@ -203,11 +220,21 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
             lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             init_lora_weights="gaussian",
+            task_type="CAUSAL_LM"
         )
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+
+        # save initial adapter
+        checkpoint_dir = "/root/vla-cot/adapter_tmp_weights/checkpoint"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        vla.save_pretrained(
+            checkpoint_dir,
+            save_model=False,
+            save_adapter=True
+        )
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
