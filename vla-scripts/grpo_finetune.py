@@ -37,6 +37,47 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import requests
+import json_numpy as json
+
+def get_batch_actions(instruction: str, image_path: str, batch_size: int = 4, temperature: float = 1.0):
+    """
+    Get batch predictions from the batch processing server.
+    
+    Args:
+        instruction (str): The instruction for the robot
+        image_path (str): Path to the input image
+        batch_size (int, optional): Size of the batch. Defaults to 4.
+        temperature (float, optional): Sampling temperature. Defaults to 1.0.
+    
+    Returns:
+        numpy.ndarray: Array of predicted actions
+    """
+    # Verify image exists
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found at {image_path}")
+    
+    # Prepare the payload
+    payload = {
+        "instruction": instruction,
+        "image_path": image_path,
+        "batch_size": batch_size,
+        "temperature": temperature
+    }
+    
+    # Send request to server
+    response = requests.post(
+        "http://127.0.0.1:3200/batch",
+        data=json.dumps(payload),
+        headers={'Content-Type': 'application/json'}
+    )
+    
+    if response.status_code != 200:
+        raise Exception(f"Error from server: {response.text}")
+    
+    response_data = json.loads(response.text)
+    return np.array(response_data["output_ids"]), np.array(response_data["actions"])
+
 @dataclass
 class GRPOVLAConfig:
     # fmt: off
@@ -233,22 +274,32 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             all_action_preds = []
             all_outputs = []
 
-            instruction = batch['lang']
-            batch['img'][0].save(f"images/observation.jpg") 
+            batch_size = cfg.num_generations
+            instruction = batch['lang'].lower()
+
+            batch['img'][0].save(f"images/observation.jpg")
+            image_path = "/root/openvla/images/observation.jpg"
+
+            output_ids, actions = get_batch_actions(
+                instruction=instruction,
+                image_path=image_path,
+                batch_size=1,
+                temperature=0
+            )
             
-            for _ in range(cfg.num_generations):
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    output: CausalLMOutputWithPast = vla(
-                        input_ids=batch["input_ids"].to(device_id),
-                        attention_mask=batch["attention_mask"].to(device_id),
-                        pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                        labels=batch["labels"],
-                    )
+            # for _ in range(cfg.num_generations):
+            #     with torch.autocast("cuda", dtype=torch.bfloat16):
+            #         output: CausalLMOutputWithPast = vla(
+            #             input_ids=batch["input_ids"].to(device_id),
+            #             attention_mask=batch["attention_mask"].to(device_id),
+            #             pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+            #             labels=batch["labels"],
+            #         )
                 
-                action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
-                action_preds = action_logits.argmax(dim=2)
-                all_action_preds.append(action_preds)
-                all_outputs.append(output)
+            #     action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
+            #     action_preds = action_logits.argmax(dim=2)
+            #     all_action_preds.append(action_preds)
+            #     all_outputs.append(output)
 
             # Stack predictions from multiple generations
             action_preds = torch.stack(all_action_preds, dim=1)  # [batch_size, num_generations, seq_len]
