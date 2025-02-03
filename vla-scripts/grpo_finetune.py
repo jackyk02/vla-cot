@@ -33,6 +33,7 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+import numpy as np
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -275,10 +276,10 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             all_outputs = []
 
             batch_size = cfg.num_generations
-            instruction = batch['lang'].lower()
+            instruction = batch['lang'][0].lower()
 
             batch['img'][0].save(f"images/observation.jpg")
-            image_path = "/root/openvla/images/observation.jpg"
+            image_path = "/root/vla-cot/images/observation.jpg"
 
             output_ids, actions = get_batch_actions(
                 instruction=instruction,
@@ -286,6 +287,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                 batch_size=1,
                 temperature=0
             )
+            print(output_ids)
             
             # for _ in range(cfg.num_generations):
             #     with torch.autocast("cuda", dtype=torch.bfloat16):
