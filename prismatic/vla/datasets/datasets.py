@@ -64,7 +64,7 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name)
+        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, action=action, img=img, lang=lang)
 
 
 class RLDSDataset(IterableDataset):

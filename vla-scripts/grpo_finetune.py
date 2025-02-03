@@ -65,7 +65,7 @@ class GRPOVLAConfig:
     beta: float = 0.1  # KL penalty coefficient
     temperature: float = 0.7
     max_prompt_length: int = 512
-    max_completion_length: int = 128
+    max_completion_length: int = 512
 
     # LoRA Arguments
     use_lora: bool = True                                           # Whether to use LoRA fine-tuning
