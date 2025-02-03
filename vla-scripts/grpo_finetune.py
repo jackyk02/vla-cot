@@ -252,30 +252,23 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             action_preds = action_preds.view(-1, action_preds.size(-1))
 
             # Get model and reference model logprobs
-            def get_per_token_logps(model, inputs, is_ref=False):
-                if is_ref:
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        output = model(
-                            input_ids=inputs["input_ids"],
-                            attention_mask=inputs["attention_mask"],
-                            pixel_values=inputs["pixel_values"].to(torch.bfloat16),
-                            labels=inputs["labels"]
-                        )
-                else:
-                    output = all_outputs[0]  # Use first output for policy logprobs
+            def get_per_token_logps(model, inputs):
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    output = model(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        pixel_values=inputs["pixel_values"].to(torch.bfloat16),
+                        labels=inputs["labels"]
+                    )
                 
                 logits = output.logits[:, model.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
                 log_probs = torch.log_softmax(logits, dim=-1)
                 
                 # Get the relevant action predictions for this batch
-                if is_ref:
                     # For reference model, we need to repeat the log_probs to match all generations
-                    log_probs = log_probs.repeat(cfg.num_generations, 1, 1)
-                    relevant_preds = action_preds  # Use all predictions
-                else:
-                    # For policy model, we only use the predictions from the first generation
-                    relevant_preds = action_preds[:batch_size]  # Only use first batch's predictions
-                
+                log_probs = log_probs.repeat(cfg.num_generations, 1, 1)
+                relevant_preds = action_preds  # Use all predictions
+        
                 # Gather log probs for the predicted actions
                 per_token_logps = torch.gather(
                     log_probs,
@@ -287,8 +280,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                 
             # Compute policy and reference logprobs
             per_token_logps = get_per_token_logps(vla, batch)
-            # print(per_token_logps)
-            ref_per_token_logps = get_per_token_logps(ref_vla, batch, is_ref=True)
+            ref_per_token_logps = get_per_token_logps(ref_vla, batch)
 
             # Compute KL divergence
             per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - \
