@@ -241,9 +241,11 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
 
             for _ in range(cfg.num_generations):
                 inputs = processor(prompt, image).to(device_id, dtype=torch.bfloat16)
-                generated_ids = sampler.generate(**inputs, max_new_tokens=sampler.get_action_dim(unnorm_key), do_sample=False, temperature=0)
+                generated_ids = sampler.generate(**inputs, max_new_tokens=sampler.get_action_dim(unnorm_key), do_sample=True, temperature=2.0)
                 predicted_action_token_ids = generated_ids[0, -sampler.get_action_dim(unnorm_key) :].cpu().tolist()
                 all_action_preds.append(predicted_action_token_ids)
+            
+            print(all_action_preds)
 
             all_action_preds = [torch.tensor([all_action_preds[i]], device=device_id) for i in range(len(all_action_preds))]
 
