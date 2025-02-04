@@ -68,7 +68,7 @@ class GRPOVLAConfig:
     # GRPO Specific Parameters
     num_generations: int = 2  # Number of trajectories per input
     beta: float = 0.1  # KL penalty coefficient
-    temperature: float = 10.0
+    temperature: float = 0.0
     max_prompt_length: int = 512
     max_completion_length: int = 512
 
@@ -260,7 +260,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
-            # Extract groundtruth action
+            batch["input_ids"] = batch["input_ids"][:, :-8]
             action_gt = batch["labels"][:, 1:][:, -8:-1]
             continuous_gt = converter.token_to_action(action_gt.cpu().numpy())
 
@@ -310,7 +310,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                 generated_ids = vla.module.generate(
                     **inputs,
                     max_new_tokens=vla.module.get_action_dim("bridge_orig"),
-                    do_sample=True,
+                    do_sample=False,
                     temperature=cfg.temperature
                 )
                 
@@ -332,6 +332,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                     )
                 
                 # Store results
+                print("generated", generated_ids)
                 all_policy_logps.append(policy_logps)
                 all_ref_logps.append(ref_logps)
                 all_action_preds.append(generated_ids[:, -9:-2])
@@ -344,14 +345,15 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                     calculate_nrmse(gt, cs)
                     for gt, cs in zip(continuous_gt, continuous_sampled)
                 ])  # shape: (B,)
+                print("rewards_gen", rewards_gen)
                 # Use exponential decay on the error to get a reward; higher reward is better
                 reward_vals = np.exp(-rewards_gen)  # shape: (B,)
                 reward_preds.append(torch.tensor(reward_vals, device=device_id, dtype=torch.float32))
 
-            print(all_policy_logps)
-            print(all_ref_logps)
-            print(all_action_preds)
-            print(reward_preds)
+            # print(all_policy_logps)
+            # print(all_ref_logps)
+            # print(all_action_preds)
+            # print(reward_preds)
 
             policy_logps = torch.stack(all_policy_logps, dim=1)  # (B, G, L)
             ref_logps = torch.stack(all_ref_logps, dim=1)        # (B, G, L)
