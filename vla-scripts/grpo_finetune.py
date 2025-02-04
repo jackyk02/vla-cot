@@ -38,47 +38,6 @@ import numpy as np
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import requests
-import json_numpy as json
-
-def get_batch_actions(instruction: str, image_path: str, batch_size: int = 4, temperature: float = 1.0):
-    """
-    Get batch predictions from the batch processing server.
-    
-    Args:
-        instruction (str): The instruction for the robot
-        image_path (str): Path to the input image
-        batch_size (int, optional): Size of the batch. Defaults to 4.
-        temperature (float, optional): Sampling temperature. Defaults to 1.0.
-    
-    Returns:
-        numpy.ndarray: Array of predicted actions
-    """
-    # Verify image exists
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Image not found at {image_path}")
-    
-    # Prepare the payload
-    payload = {
-        "instruction": instruction,
-        "image_path": image_path,
-        "batch_size": batch_size,
-        "temperature": temperature
-    }
-    
-    # Send request to server
-    response = requests.post(
-        "http://127.0.0.1:3200/batch",
-        data=json.dumps(payload),
-        headers={'Content-Type': 'application/json'}
-    )
-    
-    if response.status_code != 200:
-        raise Exception(f"Error from server: {response.text}")
-    
-    response_data = json.loads(response.text)
-    return np.array(response_data["output_ids"]), np.array(response_data["actions"])
-
 @dataclass
 class GRPOVLAConfig:
     # fmt: off
@@ -211,6 +170,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
+    sampler = vla.module
     ref_vla = DDP(ref_vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
     # Create Action Tokenizer
@@ -273,36 +233,19 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
             all_action_preds = []
-            all_outputs = []
 
-            batch_size = cfg.num_generations
+            unnorm_key="bridge_orig"
             instruction = batch['lang'][0].lower()
+            prompt = f"In: What action should the robot take to {instruction}?\nOut:"
+            image = batch['img'][0]
 
-            batch['img'][0].save(f"images/observation.jpg")
-            image_path = "/root/vla-cot/images/observation.jpg"
+            for _ in range(cfg.num_generations):
+                inputs = processor(prompt, image).to(device_id, dtype=torch.bfloat16)
+                generated_ids = sampler.generate(**inputs, max_new_tokens=sampler.get_action_dim(unnorm_key), do_sample=False, temperature=0)
+                predicted_action_token_ids = generated_ids[0, -sampler.get_action_dim(unnorm_key) :].cpu().tolist()
+                all_action_preds.append(predicted_action_token_ids)
 
-            output_ids, actions = get_batch_actions(
-                instruction=instruction,
-                image_path=image_path,
-                batch_size=batch_size,
-                temperature=0
-            )
-            all_action_preds = [torch.tensor([output_ids[i]], device=device_id) for i in range(len(output_ids))]
-            print(all_action_preds)
-
-            # for _ in range(cfg.num_generations):
-            #     with torch.autocast("cuda", dtype=torch.bfloat16):
-            #         output: CausalLMOutputWithPast = vla(
-            #             input_ids=batch["input_ids"].to(device_id),
-            #             attention_mask=batch["attention_mask"].to(device_id),
-            #             pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-            #             labels=batch["labels"],
-            #         )
-                
-            #     action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
-            #     action_preds = action_logits.argmax(dim=2)
-            #     all_action_preds.append(action_preds)
-            #     all_outputs.append(output)
+            all_action_preds = [torch.tensor([all_action_preds[i]], device=device_id) for i in range(len(all_action_preds))]
 
             # Stack predictions from multiple generations
             action_preds = torch.stack(all_action_preds, dim=1)  # [batch_size, num_generations, seq_len]
