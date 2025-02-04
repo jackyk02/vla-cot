@@ -170,7 +170,6 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
-    sampler = vla.module
     ref_vla = DDP(ref_vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
     # Create Action Tokenizer
@@ -234,16 +233,22 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
         for batch_idx, batch in enumerate(dataloader):
             all_action_preds = []
 
-            unnorm_key="bridge_orig"
-            instruction = batch['lang'][0].lower()
-            prompt = f"In: What action should the robot take to {instruction}?\nOut:"
-            image = batch['img'][0]
+            # Preprocess Batch Data
+            def convert_tensor(tensor):
+                device = vla.module.device
+                return (tensor.to(device) if tensor.dtype in [torch.long, torch.int] 
+                        else tensor.to(device, dtype=torch.bfloat16))
+
+            # Remove dataset_names and convert remaining tensors
+            inputs = {k: convert_tensor(v) for k, v in batch.items() 
+                    if k != 'dataset_names'}
 
             for _ in range(cfg.num_generations):
-                inputs = processor(prompt, image).to(device_id, dtype=torch.bfloat16)
-                generated_ids = sampler.generate(**inputs, max_new_tokens=sampler.get_action_dim(unnorm_key), do_sample=True, temperature=2.0)
-                predicted_action_token_ids = generated_ids[0, -sampler.get_action_dim(unnorm_key) :].cpu().tolist()
-                all_action_preds.append(predicted_action_token_ids)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    generated_ids = vla.module.generate(**inputs, max_new_tokens=vla.module.get_action_dim("bridge_orig"), do_sample=False, temperature=0)
+                    print(generated_ids)
+                    predicted_action_token_ids = generated_ids[0, -9 : -2].cpu().tolist()
+                    all_action_preds.append(predicted_action_token_ids)
             
             print(all_action_preds)
 
@@ -268,8 +273,8 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
 
                 logits = output.logits[:, model.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
                 logits = logits[:, -8:-1, :]
-                print(logits)
-                print(logits.shape)
+                # print(logits)
+                # print(logits.shape)
 
                 action_preds = logits.argmax(dim=2)
                 print(action_preds)

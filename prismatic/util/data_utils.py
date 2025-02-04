@@ -101,10 +101,6 @@ class PaddedCollatorForActionPrediction:
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
-
-        img = [instance["img"] for instance in instances]
-        lang = [instance["lang"] for instance in instances]
-
         if "dataset_name" in instances[0]:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
@@ -140,8 +136,6 @@ class PaddedCollatorForActionPrediction:
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
-            img=img,
-            lang=lang
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
