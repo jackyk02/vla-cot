@@ -68,7 +68,7 @@ class GRPOVLAConfig:
     # GRPO Specific Parameters
     num_generations: int = 2  # Number of trajectories per input
     beta: float = 0.1  # KL penalty coefficient
-    temperature: float = 0.7
+    temperature: float = 10.0
     max_prompt_length: int = 512
     max_completion_length: int = 512
 
@@ -273,110 +273,125 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             inputs = {k: convert_tensor(v) for k, v in batch.items() 
                     if k != 'dataset_names'}
 
-
-            # Sample G outputs 
-            all_action_preds = []
-            reward_preds = []
-            for _ in range(cfg.num_generations):
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    generated_ids = vla.module.generate(**inputs, max_new_tokens=vla.module.get_action_dim("bridge_orig"), do_sample=True, temperature=20.0)
-                    predicted_action_token_ids = generated_ids[0, -9 : -2].cpu().numpy()
-                    all_action_preds.append(predicted_action_token_ids)
-        
-                    continuous_sampled = converter.token_to_action(predicted_action_token_ids)
-                    nrmse = calculate_nrmse(continuous_gt, continuous_sampled)
-                    reward = math.exp(-nrmse)
-                    reward_preds.append(reward)
-            
-            # print(reward_preds)
-
-            all_action_preds = [torch.tensor([all_action_preds[i]], device=device_id) for i in range(len(all_action_preds))]
-
-            # Stack predictions from multiple generations
-            action_preds = torch.stack(all_action_preds, dim=1)  # [batch_size, num_generations, seq_len]
-            batch_size = action_preds.size(0)
-            
-            # Reshape to [batch_size * num_generations, seq_len]
-            action_preds = action_preds.view(-1, action_preds.size(-1))
-
-            # Get model and reference model logprobs
-            def get_per_token_logps(model, inputs):
+            # Function for getting token-level log-probs
+            def get_per_token_logps(model, generated_ids, original_input_length, pixel_values):
+                """Compute per-token log probabilities for generated action sequences."""
+                # Prepare full input sequence (prompt + generated actions)
+                batch_size, seq_len = generated_ids.shape
+                attention_mask = torch.ones_like(generated_ids)
+                
+                # Forward pass through model with complete sequence
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     output = model(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        pixel_values=inputs["pixel_values"].to(torch.bfloat16),
-                        labels=inputs["labels"]
+                        input_ids=generated_ids,
+                        pixel_values=pixel_values.to(torch.bfloat16),
+                        attention_mask=attention_mask
                     )
-
-                logits = output.logits[:, model.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
-                logits = logits[:, -8:-1, :]
-                action_preds = logits.argmax(dim=2)
-
-                # print(action_preds)
-
+                # Extract relevant logits for action tokens
+                logits = output.logits[:, -9:-2, :]  # (B, action_len, vocab)
+                action_tokens = generated_ids[:, -9:-2]   # (B, action_len)
+                
+                # Compute log probabilities for actual generated tokens
                 log_probs = torch.log_softmax(logits, dim=-1)
-    
-                # Get the relevant action predictions for this batch
-                    # For reference model, we need to repeat the log_probs to match all generations
-                log_probs = log_probs.repeat(cfg.num_generations, 1, 1)
-                relevant_preds = action_preds  # Use all predictions
-        
-                # Gather log probs for the predicted actions
-                per_token_logps = torch.gather(
-                    log_probs,
-                    dim=-1,
-                    index=relevant_preds.unsqueeze(-1)
-                ).squeeze(-1)
+                per_token_logps = torch.gather(log_probs, dim=-1, index=action_tokens.unsqueeze(-1)).squeeze(-1)
                 
                 return per_token_logps
+
+            # Modified training loop section
+            original_input_length = inputs["input_ids"].shape[1]
+            all_policy_logps = []
+            all_ref_logps = []
+            all_action_preds = []
+            reward_preds = []
+            
+            # Sample G outputs 
+            for _ in range(cfg.num_generations):
+                # Generate action sequence
+                generated_ids = vla.module.generate(
+                    **inputs,
+                    max_new_tokens=vla.module.get_action_dim("bridge_orig"),
+                    do_sample=True,
+                    temperature=cfg.temperature
+                )
                 
-            # Compute policy and reference logprobs
-            per_token_logps = get_per_token_logps(vla, batch)
-            ref_per_token_logps = get_per_token_logps(ref_vla, batch)
+                # Get policy model log probabilities
+                policy_logps = get_per_token_logps(
+                    vla.module, 
+                    generated_ids,
+                    original_input_length,
+                    inputs["pixel_values"]
+                )
+                
+                # Get reference model log probabilities
+                with torch.no_grad():
+                    ref_logps = get_per_token_logps(
+                        ref_vla.module,
+                        generated_ids,
+                        original_input_length,
+                        inputs["pixel_values"]
+                    )
+                
+                # Store results
+                all_policy_logps.append(policy_logps)
+                all_ref_logps.append(ref_logps)
+                all_action_preds.append(generated_ids[:, -9:-2])
+                
+                # Calculate reward
+                continuous_sampled = converter.token_to_action(
+                    generated_ids[:, -9 : -2].cpu().numpy()
+                )
+                rewards_gen = np.array([
+                    calculate_nrmse(gt, cs)
+                    for gt, cs in zip(continuous_gt, continuous_sampled)
+                ])  # shape: (B,)
+                # Use exponential decay on the error to get a reward; higher reward is better
+                reward_vals = np.exp(-rewards_gen)  # shape: (B,)
+                reward_preds.append(torch.tensor(reward_vals, device=device_id, dtype=torch.float32))
 
-            # Compute KL divergence
-            per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - \
-                          (ref_per_token_logps - per_token_logps) - 1
+            print(all_policy_logps)
+            print(all_ref_logps)
+            print(all_action_preds)
+            print(reward_preds)
 
-            # Create completion mask based on action_gt
+            policy_logps = torch.stack(all_policy_logps, dim=1)  # (B, G, L)
+            ref_logps = torch.stack(all_ref_logps, dim=1)        # (B, G, L)
+            action_preds = torch.stack(all_action_preds, dim=1)  # (B, G, L)
+            rewards = torch.stack(reward_preds, dim=1)           # (B, G)
+
+            # Compute per-token KL divergence: (B, G, L)
+            per_token_kl = torch.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
+
+            # Create a mask for the generated action tokens.
+            # Here we assume that groundtruth action tokens are used to define the valid region.
+            # Expand groundtruth mask from shape (B, L) to (B, G, L) to match generated tokens.
             action_gt = batch["labels"][:, 1:].to(action_preds.device)
             action_gt = action_gt[:, -8:-1]
-            mask = action_gt > action_tokenizer.action_token_begin_idx
-            mask = mask.repeat(cfg.num_generations, 1)  # Repeat for all generations
+            mask = (action_gt > action_tokenizer.action_token_begin_idx)  # (B, L)
+            mask = mask.unsqueeze(1).expand(-1, cfg.num_generations, -1)    # (B, G, L)
 
-            # Generate random binary rewards for testing
-            # rewards = torch.randint(0, 2, (batch_size * cfg.num_generations,), device=device_id).float()
-            rewards = torch.tensor(reward_preds, device=device_id)
-            print("reward: " ,rewards)
+            # Compute advantages per sample and per generation.
+            # Instead of reshaping, compute along the generation dimension directly.
+            advantages = (rewards - rewards.mean(dim=1, keepdim=True)) / (rewards.std(dim=1, keepdim=True) + 1e-4)
+            # Expand advantages to match (B, G, L)
+            advantages = advantages.unsqueeze(2)  # (B, G, 1)
 
-            # Compute advantages
-            mean_grouped_rewards = rewards.view(-1, cfg.num_generations).mean(dim=1)
-            std_grouped_rewards = rewards.view(-1, cfg.num_generations).std(dim=1)
-            
-            # Repeat for each generation
-            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(cfg.num_generations, dim=0)
-            std_grouped_rewards = std_grouped_rewards.repeat_interleave(cfg.num_generations, dim=0)
-            advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-
-            print("adv: ", advantages)
-
-            # Compute GRPO loss
-            per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+            # Compute the GRPO loss:
+            per_token_loss = torch.exp(policy_logps - policy_logps.detach()) * advantages
             per_token_loss = -(per_token_loss - cfg.beta * per_token_kl)
-            loss = ((per_token_loss * mask).sum(dim=1) / mask.sum(dim=1)).mean()
-            
-            # Compute accuracy for logging
-            correct_preds = (action_preds == action_gt.repeat(cfg.num_generations, 1)) & mask
+            # Average over token dimension and then over batch and generations
+            loss = ((per_token_loss * mask).sum(dim=2) / mask.sum(dim=2)).mean()
+
+            # Compute action accuracy for logging.
+            # Expand groundtruth actions (B, L) to (B, G, L)
+            action_gt_exp = action_gt.unsqueeze(1).expand_as(action_preds)
+            correct_preds = (action_preds == action_gt_exp) & mask
             action_accuracy = correct_preds.sum().float() / mask.sum().float()
 
-            # Scale loss and backward pass
+            # Backpropagation step
             normalized_loss = loss / cfg.grad_accumulation_steps
             normalized_loss.backward()
 
-            print("loss: ", normalized_loss)
-
-            # Store metrics
+            # Store metrics for logging
             recent_losses.append(loss.item())
             recent_rewards.append(rewards.mean().item())
             recent_kls.append(per_token_kl.mean().item())
