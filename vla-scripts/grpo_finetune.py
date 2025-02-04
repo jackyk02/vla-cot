@@ -34,6 +34,10 @@ from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 import numpy as np
+import math
+
+from prismatic.vla.token2action import TokenActionConverter
+converter = TokenActionConverter()
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -82,6 +86,31 @@ class GRPOVLAConfig:
 
     # fmt: on
 
+min_values = np.array([-0.02872725307941437,
+          -0.04170349963009357,
+          -0.026093858778476715,
+          -0.08092105075716972,
+          -0.09288699507713317,
+          -0.20718276381492615,
+          0.0])
+max_values = np.array([0.028309678435325586,
+          0.040855254605412394,
+          0.040161586627364146,
+          0.08192047759890528,
+          0.07792850524187081,
+          0.20382574498653397,
+          1.0])
+ranges = max_values - min_values
+
+def calculate_nrmse(action_gt, action_sampled):
+    l0 = action_gt
+    l1 = action_sampled
+
+    # Normalize the difference by the range
+    normalized_diff = (l0 - l1) / ranges
+    nrmse = np.sqrt(np.mean(normalized_diff**2))
+
+    return nrmse
 
 @draccus.wrap()
 def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
@@ -231,26 +260,35 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
-            all_action_preds = []
+            # Extract groundtruth action
+            action_gt = batch["labels"][:, 1:][:, -8:-1]
+            continuous_gt = converter.token_to_action(action_gt.cpu().numpy())
 
             # Preprocess Batch Data
             def convert_tensor(tensor):
                 device = vla.module.device
                 return (tensor.to(device) if tensor.dtype in [torch.long, torch.int] 
                         else tensor.to(device, dtype=torch.bfloat16))
-
             # Remove dataset_names and convert remaining tensors
             inputs = {k: convert_tensor(v) for k, v in batch.items() 
                     if k != 'dataset_names'}
 
+
+            # Sample G outputs 
+            all_action_preds = []
+            reward_preds = []
             for _ in range(cfg.num_generations):
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    generated_ids = vla.module.generate(**inputs, max_new_tokens=vla.module.get_action_dim("bridge_orig"), do_sample=False, temperature=0)
-                    print(generated_ids)
-                    predicted_action_token_ids = generated_ids[0, -9 : -2].cpu().tolist()
+                    generated_ids = vla.module.generate(**inputs, max_new_tokens=vla.module.get_action_dim("bridge_orig"), do_sample=True, temperature=20.0)
+                    predicted_action_token_ids = generated_ids[0, -9 : -2].cpu().numpy()
                     all_action_preds.append(predicted_action_token_ids)
+        
+                    continuous_sampled = converter.token_to_action(predicted_action_token_ids)
+                    nrmse = calculate_nrmse(continuous_gt, continuous_sampled)
+                    reward = math.exp(-nrmse)
+                    reward_preds.append(reward)
             
-            print(all_action_preds)
+            # print(reward_preds)
 
             all_action_preds = [torch.tensor([all_action_preds[i]], device=device_id) for i in range(len(all_action_preds))]
 
@@ -273,14 +311,12 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
 
                 logits = output.logits[:, model.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
                 logits = logits[:, -8:-1, :]
-                # print(logits)
-                # print(logits.shape)
-
                 action_preds = logits.argmax(dim=2)
-                print(action_preds)
+
+                # print(action_preds)
 
                 log_probs = torch.log_softmax(logits, dim=-1)
-                
+    
                 # Get the relevant action predictions for this batch
                     # For reference model, we need to repeat the log_probs to match all generations
                 log_probs = log_probs.repeat(cfg.num_generations, 1, 1)
@@ -310,7 +346,9 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             mask = mask.repeat(cfg.num_generations, 1)  # Repeat for all generations
 
             # Generate random binary rewards for testing
-            rewards = torch.randint(0, 2, (batch_size * cfg.num_generations,), device=device_id).float()
+            # rewards = torch.randint(0, 2, (batch_size * cfg.num_generations,), device=device_id).float()
+            rewards = torch.tensor(reward_preds, device=device_id)
+            print("reward: " ,rewards)
 
             # Compute advantages
             mean_grouped_rewards = rewards.view(-1, cfg.num_generations).mean(dim=1)
@@ -320,6 +358,8 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(cfg.num_generations, dim=0)
             std_grouped_rewards = std_grouped_rewards.repeat_interleave(cfg.num_generations, dim=0)
             advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+            print("adv: ", advantages)
 
             # Compute GRPO loss
             per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
@@ -334,7 +374,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             normalized_loss = loss / cfg.grad_accumulation_steps
             normalized_loss.backward()
 
-            print(normalized_loss)
+            print("loss: ", normalized_loss)
 
             # Store metrics
             recent_losses.append(loss.item())
