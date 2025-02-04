@@ -260,7 +260,9 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
-            batch["input_ids"] = batch["input_ids"][:, :-8]
+            
+            # Remove the gt action from input_id
+            batch["input_ids"] = batch["input_ids"][:, :-8] 
             action_gt = batch["labels"][:, 1:][:, -8:-1]
             continuous_gt = converter.token_to_action(action_gt.cpu().numpy())
 
@@ -269,6 +271,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                 device = vla.module.device
                 return (tensor.to(device) if tensor.dtype in [torch.long, torch.int] 
                         else tensor.to(device, dtype=torch.bfloat16))
+                    
             # Remove dataset_names and convert remaining tensors
             inputs = {k: convert_tensor(v) for k, v in batch.items() 
                     if k != 'dataset_names'}
@@ -288,8 +291,9 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                         attention_mask=attention_mask
                     )
                 # Extract relevant logits for action tokens
-                logits = output.logits[:, -9:-2, :]  # (B, action_len, vocab)
-                action_tokens = generated_ids[:, -9:-2]   # (B, action_len)
+                logits = output.logits[:, original_input_length-1:-1, :]  # (B, action_len, vocab)
+                action_tokens = generated_ids[:, original_input_length:]   # (B, action_len)
+                print("act tok:" , action_tokens)
                 
                 # Compute log probabilities for actual generated tokens
                 log_probs = torch.log_softmax(logits, dim=-1)
@@ -335,11 +339,11 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                 print("generated", generated_ids)
                 all_policy_logps.append(policy_logps)
                 all_ref_logps.append(ref_logps)
-                all_action_preds.append(generated_ids[:, -9:-2])
+                all_action_preds.append(generated_ids[:, original_input_length:])
                 
                 # Calculate reward
                 continuous_sampled = converter.token_to_action(
-                    generated_ids[:, -9 : -2].cpu().numpy()
+                    generated_ids[:, original_input_length:].cpu().numpy()
                 )
                 rewards_gen = np.array([
                     calculate_nrmse(gt, cs)
@@ -366,8 +370,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             # Create a mask for the generated action tokens.
             # Here we assume that groundtruth action tokens are used to define the valid region.
             # Expand groundtruth mask from shape (B, L) to (B, G, L) to match generated tokens.
-            action_gt = batch["labels"][:, 1:].to(action_preds.device)
-            action_gt = action_gt[:, -8:-1]
+            action_gt = action_gt.to(action_preds.device)
             mask = (action_gt > action_tokenizer.action_token_begin_idx)  # (B, L)
             mask = mask.unsqueeze(1).expand(-1, cfg.num_generations, -1)    # (B, G, L)
 
