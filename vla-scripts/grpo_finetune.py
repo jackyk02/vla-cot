@@ -159,6 +159,19 @@ def calculate_rewards(
     rewards = np.exp(-nrmse)
     return torch.tensor(rewards, dtype=torch.float32)
 
+def remove_padding(batch):
+    # Find where the padding tokens (32000) start in input_ids
+    non_padding_mask = batch['input_ids'][0] != 32000
+    
+    # Get the actual sequence length (before padding)
+    actual_length = torch.sum(non_padding_mask)
+    
+    # Slice the input_ids and attention_mask
+    batch['input_ids'] = batch['input_ids'][:, :actual_length]
+    batch['attention_mask'] = batch['attention_mask'][:, :actual_length]
+    
+    return batch
+
 def generate_with_padding(
     model: torch.nn.Module,
     inputs: Dict[str, torch.Tensor],
@@ -173,7 +186,8 @@ def generate_with_padding(
     
     for i in range(batch_size):
         single_input = {k: v[i:i+1] for k, v in inputs.items()}
-        
+        single_input = remove_padding(single_input)
+        # print("single input", single_input)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             gen_ids = model.generate(
                 **single_input,
@@ -199,6 +213,10 @@ def generate_with_padding(
             gen = torch.cat([gen, padding], dim=1)
         padded.append(gen)
     
+    print("generated: ", padded)
+
+    import sys
+    sys.exit()
     return torch.cat(padded, dim=0)
 
 def save_checkpoint(
@@ -233,17 +251,19 @@ def train_step(
     }
     
     # Remove ground truth actions from input
-    inputs["input_ids"] = inputs["input_ids"][:, :-8]
-    action_gt = batch["labels"][:, 1:][:, -8:-1].to(device_id)
-    continuous_gt = converter.token_to_action(action_gt.cpu().numpy())
-    
+    # print("in_ids: ", inputs["input_ids"])
+    # print("labels: ", inputs["labels"])
+
+    continuous_gt = converter.token_to_action(inputs["labels"].cpu().numpy())
+    # print(continuous_gt)
+
     # Storage for multiple generations
     all_policy_logps = []
     all_ref_logps = []
     all_action_preds = []
     all_rewards = []
     
-    input_length = inputs["input_ids"].shape[1]
+    # input_length = inputs["input_ids"].shape[1]
     
     # Generate multiple trajectories
     for _ in range(config.num_generations):
