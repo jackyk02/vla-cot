@@ -112,6 +112,31 @@ def calculate_nrmse(action_gt, action_sampled):
 
     return nrmse
 
+# Function for getting token-level log-probs
+def get_per_token_logps(model, generated_ids, original_input_length, pixel_values):
+    """Compute per-token log probabilities for generated action sequences."""
+    # Prepare full input sequence (prompt + generated actions)
+    batch_size, seq_len = generated_ids.shape
+    attention_mask = torch.ones_like(generated_ids)
+    
+    # Forward pass through model with complete sequence
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        output = model(
+            input_ids=generated_ids,
+            pixel_values=pixel_values.to(torch.bfloat16),
+            attention_mask=attention_mask
+        )
+    # Extract relevant logits for action tokens
+    logits = output.logits[:, original_input_length-1:-1, :]  # (B, action_len, vocab)
+    action_tokens = generated_ids[:, original_input_length:]   # (B, action_len)
+    print("act tok:" , action_tokens)
+    
+    # Compute log probabilities for actual generated tokens
+    log_probs = torch.log_softmax(logits, dim=-1)
+    per_token_logps = torch.gather(log_probs, dim=-1, index=action_tokens.unsqueeze(-1)).squeeze(-1)
+    
+    return per_token_logps
+
 @draccus.wrap()
 def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
     """Main training function for GRPO-VLA."""
@@ -276,31 +301,6 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             inputs = {k: convert_tensor(v) for k, v in batch.items() 
                     if k != 'dataset_names'}
 
-            # Function for getting token-level log-probs
-            def get_per_token_logps(model, generated_ids, original_input_length, pixel_values):
-                """Compute per-token log probabilities for generated action sequences."""
-                # Prepare full input sequence (prompt + generated actions)
-                batch_size, seq_len = generated_ids.shape
-                attention_mask = torch.ones_like(generated_ids)
-                
-                # Forward pass through model with complete sequence
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    output = model(
-                        input_ids=generated_ids,
-                        pixel_values=pixel_values.to(torch.bfloat16),
-                        attention_mask=attention_mask
-                    )
-                # Extract relevant logits for action tokens
-                logits = output.logits[:, original_input_length-1:-1, :]  # (B, action_len, vocab)
-                action_tokens = generated_ids[:, original_input_length:]   # (B, action_len)
-                print("act tok:" , action_tokens)
-                
-                # Compute log probabilities for actual generated tokens
-                log_probs = torch.log_softmax(logits, dim=-1)
-                per_token_logps = torch.gather(log_probs, dim=-1, index=action_tokens.unsqueeze(-1)).squeeze(-1)
-                
-                return per_token_logps
-
             # Modified training loop section
             original_input_length = inputs["input_ids"].shape[1]
             all_policy_logps = []
@@ -310,13 +310,22 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             
             # Sample G outputs 
             for _ in range(cfg.num_generations):
-                # Generate action sequence
-                generated_ids = vla.module.generate(
-                    **inputs,
-                    max_new_tokens=vla.module.get_action_dim("bridge_orig"),
-                    do_sample=False,
-                    temperature=cfg.temperature
-                )
+                # Generate outputs for each sample in the batch individually
+                generated_ids_list = []
+                batch_size = inputs["input_ids"].size(0)
+                for i in range(batch_size):
+                    # Create a single-example input by slicing each tensor along the batch dimension
+                    single_input = {k: v[i : i + 1] for k, v in inputs.items()}
+                    gen_ids = vla.module.generate(
+                        **single_input,
+                        max_new_tokens=vla.module.get_action_dim("bridge_orig"),
+                        do_sample=False,
+                        temperature=cfg.temperature,
+                    )
+                    generated_ids_list.append(gen_ids)
+
+                # Concatenate the individual outputs into a single tensor
+                generated_ids = torch.cat(generated_ids_list, dim=0)
                 
                 # Get policy model log probabilities
                 policy_logps = get_per_token_logps(
