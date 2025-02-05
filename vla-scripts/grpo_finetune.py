@@ -103,16 +103,19 @@ class GRPOVLAConfig:
 def get_per_token_logps(
     model: torch.nn.Module,
     generated_ids: torch.Tensor,
-    mask: torch.Tensor,
     pixel_values: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    """Compute per-token log probabilities for generated action sequences."""
+    """Compute per-token log probabilities for generated action sequences,
+    but only for tokens that occur after the token 259.
     
+    This code assumes that in each sequence the first occurrence of token 259 
+    (ignoring the very first token, if it is special) marks the point after which 
+    the log probabilities should be kept.
+    """
     batch_size = generated_ids.size(0)
-    if attention_mask is None:
-        attention_mask = torch.ones_like(generated_ids)
+    attention_mask = torch.ones_like(generated_ids)
     
+    # Compute model outputs under autocast
     with torch.autocast("cuda", dtype=torch.bfloat16):
         output = model(
             input_ids=generated_ids,
@@ -121,31 +124,52 @@ def get_per_token_logps(
             return_dict=True
         )
     
-    # Get logits and shift for next token prediction
-    logits = output.logits[:, :-1]  # (batch_size, seq_len-1, vocab_size)
-    generated_ids = generated_ids[:, 1:]  # (batch_size, seq_len-1)
-    mask = mask[:, 1:]  # (batch_size, seq_len-1)
+    # ---
+    # Standard practice: we predict token t+1 given token t.
+    # So we use the logits for positions 0 ... (L-2) to predict tokens 1 ... (L-1)
+    # (Note that generated_ids has shape (batch, L) and logits has shape (batch, L, vocab_size)
+    #  so we slice logits to (batch, L-1, vocab_size) and generated_ids accordingly.)
+    logits = output.logits[:, :-1]          # shape: (batch_size, seq_len-1, vocab_size)
+    shifted_ids = generated_ids[:, 1:]        # shape: (batch_size, seq_len-1)
     
-    # Calculate log probabilities
-    log_probs = F.log_softmax(logits, dim=-1)  # (batch_size, seq_len-1, vocab_size)
-    per_token_logps = log_probs.gather(-1, generated_ids.unsqueeze(-1)).squeeze(-1)  # (batch_size, seq_len-1)
+    # Compute log probabilities from logits.
+    # log_probs has shape: (batch_size, seq_len-1, vocab_size)
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    # Gather the log probability for each generated token
+    per_token_logps = log_probs.gather(-1, shifted_ids.unsqueeze(-1)).squeeze(-1)
     
-    # Create the final tensor with proper padding
-    action_length = mask.sum(dim=1).max().item()
-    result = torch.zeros((batch_size, action_length), 
-                        device=generated_ids.device, 
-                        dtype=per_token_logps.dtype)
-    
-    # Fill in the log probabilities for each batch
+    # ---
+    # Find the first occurrence of token 259 in the shifted sequences.
+    # (If you want to search the original generated_ids you’ll need to adjust for the shift.)
+    token_starts = []
     for b in range(batch_size):
-        # Get positions of action tokens for this batch
-        positions = mask[b].nonzero().squeeze(-1)
-        # Get log probs for those positions
-        batch_logps = per_token_logps[b, positions]
-        # Fill into result tensor
-        result[b, :len(batch_logps)] = batch_logps[:action_length]
+        # Find indices in the shifted sequence where the token equals 259.
+        # (We assume there is at least one occurrence; otherwise we default to the beginning.)
+        idx = (shifted_ids[b] == 259).nonzero(as_tuple=False) + 1
+        if idx.numel() > 0:
+            # Use the first occurrence; note that the token following 259 is at the same index in per_token_logps.
+            start = idx[0].item()
+        else:
+            start = 0
+        token_starts.append(start)
     
+    # For each sequence in the batch, we now want only the log probabilities
+    # that occur at or after the found start index.
+    # First, find the maximum remaining length over the batch for proper padding.
+    max_length = max(per_token_logps[b, token_starts[b]:].size(0) for b in range(batch_size))
+    result = torch.zeros((batch_size, max_length), device=per_token_logps.device, dtype=per_token_logps.dtype)
+    
+    for b in range(batch_size):
+        start = token_starts[b]
+        # Slice out log probs for tokens after (and including) the token following 259.
+        # (Because the shifted sequence has the token that comes after each original token.)
+        batch_logps = per_token_logps[b, start:]
+        result[b, :batch_logps.size(0)] = batch_logps
+
+    # (Optional) print inputs for debugging
+    result = result[:, :7]
     return result
+
 
 def calculate_rewards(
     action_gt: np.ndarray,
@@ -212,11 +236,6 @@ def generate_with_padding(
             )
             gen = torch.cat([gen, padding], dim=1)
         padded.append(gen)
-    
-    print("generated: ", padded)
-
-    import sys
-    sys.exit()
     return torch.cat(padded, dim=0)
 
 def save_checkpoint(
@@ -274,13 +293,10 @@ def train_step(
             model.module.config.pad_token_id,
             config.temperature
         )
-        
-        mask = generated_ids > action_tokenizer.action_token_begin_idx
-        
+                
         policy_logps = get_per_token_logps(
             model.module,
             generated_ids,
-            mask,
             inputs["pixel_values"]
         )
         
@@ -288,7 +304,6 @@ def train_step(
             ref_logps = get_per_token_logps(
                 ref_model.module,
                 generated_ids,
-                mask,
                 inputs["pixel_values"]
             )
         
