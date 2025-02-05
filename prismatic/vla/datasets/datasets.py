@@ -22,6 +22,7 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
+from prismatic.vla.token2action import TokenActionConverter
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
@@ -45,14 +46,15 @@ class RLDSBatchTransform:
         prompt_builder = self.prompt_builder_fn("openvla")
         conversation = [
             {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": self.action_tokenizer(action)},
+            {"from": "gpt", "value": ""}, #mask answer
         ]
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
 
         # Tokenize (w/ `base_tokenizer`)
-        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
-        labels = list(input_ids)
+        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids[:-1] #remove 2 at the end
+        # labels = list(input_ids)
+        labels = self.action_tokenizer.actions_to_ids(action)
 
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
