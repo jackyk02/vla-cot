@@ -170,7 +170,6 @@ def get_per_token_logps(
     result = result[:, :7]
     return result
 
-
 def calculate_rewards(
     action_gt: np.ndarray,
     action_sampled: np.ndarray,
@@ -202,16 +201,22 @@ def generate_with_padding(
     max_new_tokens: int,
     pad_token_id: int,
     temperature: float = 0.0
-) -> torch.Tensor:
-    """Generate tokens with proper padding handling."""
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate tokens with proper padding handling and return action predictions.
+    Returns:
+        Tuple containing:
+        - Padded generated sequences
+        - Action predictions (last 7 tokens of each sequence)
+    """
     
     batch_size = inputs["input_ids"].size(0)
     generated = []
+    action_preds = []
     
     for i in range(batch_size):
         single_input = {k: v[i:i+1] for k, v in inputs.items()}
         single_input = remove_padding(single_input)
-        # print("single input", single_input)
+        
         with torch.autocast("cuda", dtype=torch.bfloat16):
             gen_ids = model.generate(
                 **single_input,
@@ -221,6 +226,8 @@ def generate_with_padding(
                 pad_token_id=pad_token_id
             )
         generated.append(gen_ids)
+        # Extract last 7 tokens for action prediction
+        action_preds.append(gen_ids[:, -7:])
     
     max_len = max(ids.size(1) for ids in generated)
     padded = []
@@ -236,7 +243,8 @@ def generate_with_padding(
             )
             gen = torch.cat([gen, padding], dim=1)
         padded.append(gen)
-    return torch.cat(padded, dim=0)
+        
+    return torch.cat(padded, dim=0), torch.cat(action_preds, dim=0)
 
 def save_checkpoint(
     model: DDP,
