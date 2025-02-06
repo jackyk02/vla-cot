@@ -43,16 +43,21 @@ class RLDSBatchTransform:
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
-        prompt_builder = self.prompt_builder_fn("openvla")
-        conversation = [
-            {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": ""}, #mask answer
-        ]
-        for turn in conversation:
-            prompt_builder.add_turn(turn["from"], turn["value"])
+        
+        prompt = "A chat between a curious user and an artificial intelligence assistant. " + \
+        "The assistant gives helpful, detailed, and polite answers to the user's questions. " + \
+        f"USER: What action should the robot take to {lang.lower()}? ASSISTANT: TASK:"
+        
+        # prompt_builder = self.prompt_builder_fn("openvla")
+        # conversation = [
+        #     {"from": "human", "value": f"What action should the robot take to {lang}?"},
+        #     {"from": "gpt", "value": ""}, #mask answer
+        # ]
+        # for turn in conversation:
+        #     prompt_builder.add_turn(turn["from"], turn["value"])
 
         # Tokenize (w/ `base_tokenizer`)
-        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids[:-1] #remove 2 at the end
+        input_ids = self.base_tokenizer(prompt, add_special_tokens=True).input_ids[:-1] #remove 2 at the end
         # labels = list(input_ids)
         labels = self.action_tokenizer.actions_to_ids(action)
 
