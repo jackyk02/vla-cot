@@ -104,6 +104,7 @@ def get_per_token_logps(
     model: torch.nn.Module,
     generated_ids: torch.Tensor,
     pixel_values: torch.Tensor,
+    pad_token_id : int
 ) -> torch.Tensor:
     """Compute per-token log probabilities for generated action sequences,
     but only for tokens that occur after the token 259.
@@ -113,7 +114,7 @@ def get_per_token_logps(
     the log probabilities should be kept.
     """
     batch_size = generated_ids.size(0)
-    attention_mask = torch.ones_like(generated_ids)
+    attention_mask = (generated_ids != pad_token_id).long()
     
     # Compute model outputs under autocast
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -279,7 +280,7 @@ def train_step(
     # Remove ground truth actions from input
     # print("in_ids: ", inputs["input_ids"])
     # print("labels: ", inputs["labels"])
-
+    action_gt = inputs["labels"]
     continuous_gt = converter.token_to_action(inputs["labels"].cpu().numpy())
     # print(continuous_gt)
 
@@ -304,7 +305,8 @@ def train_step(
         policy_logps = get_per_token_logps(
             model.module,
             generated_ids,
-            inputs["pixel_values"]
+            inputs["pixel_values"],
+            model.module.config.pad_token_id
         )
         
         # Get reference logprobs with LoRA disabled
@@ -315,7 +317,8 @@ def train_step(
                 ref_logps = get_per_token_logps(
                     model.module,
                     generated_ids,
-                    inputs["pixel_values"]
+                    inputs["pixel_values"],
+                    model.module.config.pad_token_id
                 )
                 # Re-enable LoRA modules
                 model.module.enable_adapter_layers()
