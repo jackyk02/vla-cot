@@ -168,7 +168,7 @@ def get_per_token_logps(
         result[b, :batch_logps.size(0)] = batch_logps
 
     # (Optional) print inputs for debugging
-    result = result[:, :7]
+    # result = result[:, :7]
     return result
 
 def calculate_rewards(
@@ -228,8 +228,10 @@ def generate_with_padding(
             )
         generated.append(gen_ids)
         # Extract last 7 tokens for action prediction
-        action_preds.append(gen_ids[:, -7:])
+        action_preds.append(gen_ids[:, -8:-1])
     
+    print(generated)
+
     max_len = max(ids.size(1) for ids in generated)
     padded = []
     
@@ -297,7 +299,7 @@ def train_step(
         generated_ids, actions_pred = generate_with_padding(
             model.module,
             inputs,
-            model.module.get_action_dim("bridge_orig"),
+            2048,  #max new tokens
             model.module.config.pad_token_id,
             config.temperature
         )
@@ -341,9 +343,9 @@ def train_step(
     action_preds = torch.stack(all_action_preds, dim=1)
     rewards = torch.stack(all_rewards, dim=1)
 
-    # print("action_preds: ", action_preds)
-    # print("policy_logps: ", policy_logps)
-    # print("ref_logps: ", ref_logps)
+    print("action_preds: ", action_preds)
+    print("policy_logps: ", policy_logps)
+    print("ref_logps: ", ref_logps)
 
     # Calculate KL divergence
     kl_div = torch.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
@@ -495,8 +497,8 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
     )
     
     # Initialize Logging =>> W&B
-    if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
+    # if distributed_state.is_main_process:
+    #     wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
 
     # Initialize optimizer
     trainable_params = [p for p in vla.parameters() if p.requires_grad]
@@ -546,7 +548,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                         "train/loss": sum(recent_losses) / len(recent_losses),
                     }
                     progress.set_postfix(avg_metrics)
-                    wandb.log(avg_metrics, step=batch_idx)
+                    # wandb.log(avg_metrics, step=batch_idx)
             
             # Save checkpoint
             if (batch_idx > 0 and 
