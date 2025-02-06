@@ -352,6 +352,7 @@ def train_step(
     return {
         "loss": loss.item(),
         "reward": rewards.mean().item(),
+        "reward_std": rewards.std().item(),
         "kl": kl_div.mean().item(),
     }
 
@@ -493,6 +494,10 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
         num_workers=0,  # TFDS handles parallelism
     )
     
+    # Initialize Logging =>> W&B
+    if distributed_state.is_main_process:
+        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
+
     # Initialize optimizer
     trainable_params = [p for p in vla.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
@@ -500,6 +505,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
     # Initialize metric tracking
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
     recent_rewards = deque(maxlen=cfg.grad_accumulation_steps)
+    recent_rewards_std = deque(maxlen=cfg.grad_accumulation_steps)
     recent_kls = deque(maxlen=cfg.grad_accumulation_steps)
     
     # Training loop
@@ -522,6 +528,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             
             # Store metrics
             recent_losses.append(metrics["loss"])
+            recent_rewards_std.append(metrics["reward_std"])
             recent_rewards.append(metrics["reward"])
             recent_kls.append(metrics["kl"])
             
@@ -534,12 +541,13 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                 # Log metrics
                 if distributed_state.is_main_process:
                     avg_metrics = {
-                        "loss": sum(recent_losses) / len(recent_losses),
-                        "reward": sum(recent_rewards) / len(recent_rewards),
-                        "kl": sum(recent_kls) / len(recent_kls),
+                        "train/reward": sum(recent_rewards) / len(recent_rewards),
+                        "train/reward_std": sum(recent_rewards_std) / len(recent_rewards_std),
+                        "train/kl": sum(recent_kls) / len(recent_kls),
+                        "train/loss": sum(recent_losses) / len(recent_losses),
                     }
                     progress.set_postfix(avg_metrics)
-                    # wandb.log(avg_metrics, step=batch_idx)
+                    wandb.log(avg_metrics, step=batch_idx)
             
             # Save checkpoint
             if (batch_idx > 0 and 
