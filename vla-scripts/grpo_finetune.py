@@ -83,9 +83,9 @@ class GRPOVLAConfig:
     save_latest_checkpoint_only: bool = True
 
     # GRPO Specific Parameters
-    num_generations: int = 2
-    beta: float = 0.1
-    temperature: float = 0.0
+    num_generations: int = 8
+    beta: float = 0.04
+    temperature: float = 0.9
     max_prompt_length: int = 512
     max_completion_length: int = 512
 
@@ -327,7 +327,6 @@ def train_step(
                 ref_logps = policy_logps.detach()
         
         # actions_pred = generated_ids[:, input_length:]
-        print(actions_pred)
         continuous_pred = converter.token_to_action(actions_pred.cpu().numpy())
         rewards = calculate_rewards(continuous_gt, continuous_pred, ranges)
         
@@ -341,7 +340,11 @@ def train_step(
     ref_logps = torch.stack(all_ref_logps, dim=1)
     action_preds = torch.stack(all_action_preds, dim=1)
     rewards = torch.stack(all_rewards, dim=1)
-    
+
+    print("action_preds: ", action_preds)
+    print("policy_logps: ", policy_logps)
+    print("ref_logps: ", ref_logps)
+
     # Calculate KL divergence
     kl_div = torch.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
     
