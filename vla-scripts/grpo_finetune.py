@@ -341,9 +341,9 @@ def train_step(
     action_preds = torch.stack(all_action_preds, dim=1)
     rewards = torch.stack(all_rewards, dim=1)
 
-    print("action_preds: ", action_preds)
-    print("policy_logps: ", policy_logps)
-    print("ref_logps: ", ref_logps)
+    # print("action_preds: ", action_preds)
+    # print("policy_logps: ", policy_logps)
+    # print("ref_logps: ", ref_logps)
 
     # Calculate KL divergence
     kl_div = torch.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
