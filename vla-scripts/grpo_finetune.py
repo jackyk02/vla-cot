@@ -294,7 +294,7 @@ def train_step(
     
     # Generate multiple trajectories
     for _ in range(config.num_generations):
-        generated_ids = generate_with_padding(
+        generated_ids, actions_pred = generate_with_padding(
             model.module,
             inputs,
             model.module.get_action_dim("bridge_orig"),
@@ -315,7 +315,7 @@ def train_step(
                 inputs["pixel_values"]
             )
         
-        actions_pred = generated_ids[:, input_length:]
+        # actions_pred = generated_ids[:, input_length:]
         print(actions_pred)
         continuous_pred = converter.token_to_action(actions_pred.cpu().numpy())
         rewards = calculate_rewards(continuous_gt, continuous_pred, ranges)
@@ -334,10 +334,6 @@ def train_step(
     # Calculate KL divergence
     kl_div = torch.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
     
-    # Create action mask
-    mask = (action_gt > action_tokenizer.action_token_begin_idx)
-    mask = mask.unsqueeze(1).expand(-1, config.num_generations, -1)
-    
     # Calculate advantages
     advantages = (rewards - rewards.mean(dim=1, keepdim=True))
     advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-8)
@@ -346,23 +342,17 @@ def train_step(
     # Compute GRPO loss
     importance_weights = torch.exp(policy_logps - policy_logps.detach())
     policy_loss = -importance_weights * advantages
-    total_loss = (policy_loss + config.beta * kl_div) * mask
-    loss = (total_loss.sum(dim=2) / mask.sum(dim=2)).mean()
+    total_loss = policy_loss + config.beta * kl_div
+    loss = total_loss.mean()
     
     # Backward pass
     normalized_loss = loss / config.grad_accumulation_steps
     normalized_loss.backward()
     
-    # Calculate metrics
-    with torch.no_grad():
-        action_gt_exp = action_gt.unsqueeze(1).expand_as(action_preds)
-        accuracy = ((action_preds == action_gt_exp) & mask).sum().float() / mask.sum().float()
-    
     return {
         "loss": loss.item(),
         "reward": rewards.mean().item(),
         "kl": kl_div.mean().item(),
-        "accuracy": accuracy.item()
     }
 
 @draccus.wrap()
@@ -547,7 +537,6 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                         "loss": sum(recent_losses) / len(recent_losses),
                         "reward": sum(recent_rewards) / len(recent_rewards),
                         "kl": sum(recent_kls) / len(recent_kls),
-                        "action_accuracy": metrics["accuracy"]
                     }
                     progress.set_postfix(avg_metrics)
                     # wandb.log(avg_metrics, step=batch_idx)
