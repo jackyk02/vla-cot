@@ -261,7 +261,6 @@ def save_checkpoint(
 
 def train_step(
     model: DDP,
-    ref_model: DDP,
     batch: Dict[str, torch.Tensor],
     optimizer: torch.optim.Optimizer,
     action_tokenizer: ActionTokenizer,
@@ -308,12 +307,21 @@ def train_step(
             inputs["pixel_values"]
         )
         
+        # Get reference logprobs with LoRA disabled
         with torch.no_grad():
-            ref_logps = get_per_token_logps(
-                ref_model.module,
-                generated_ids,
-                inputs["pixel_values"]
-            )
+            if isinstance(model.module, PeftModel):
+                # Temporarily disable LoRA modules
+                model.module.disable_adapter_layers()
+                ref_logps = get_per_token_logps(
+                    model.module,
+                    generated_ids,
+                    inputs["pixel_values"]
+                )
+                # Re-enable LoRA modules
+                model.module.enable_adapter_layers()
+            else:
+                # If not using LoRA, reference and policy are the same
+                ref_logps = policy_logps.detach()
         
         # actions_pred = generated_ids[:, input_length:]
         print(actions_pred)
@@ -421,14 +429,6 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
     else:
         vla = vla.to(device_id)
     
-    # Create reference model
-    ref_vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device_id)
-    
     # Setup LoRA if enabled
     if cfg.use_lora:
         lora_config = LoraConfig(
@@ -444,12 +444,6 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
     # Wrap models in DDP
     vla = DDP(
         vla,
-        device_ids=[device_id],
-        find_unused_parameters=True,
-        gradient_as_bucket_view=True
-    )
-    ref_vla = DDP(
-        ref_vla,
         device_ids=[device_id],
         find_unused_parameters=True,
         gradient_as_bucket_view=True
@@ -517,7 +511,6 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             # Execute training step
             metrics = train_step(
                 vla,
-                ref_vla,
                 batch,
                 optimizer,
                 action_tokenizer,
