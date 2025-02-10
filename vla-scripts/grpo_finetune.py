@@ -495,8 +495,8 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
     )
     
     # Initialize Logging =>> W&B
-    if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
+    # if distributed_state.is_main_process:
+    #     wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
 
     # Initialize optimizer
     trainable_params = [p for p in vla.parameters() if p.requires_grad]
@@ -546,7 +546,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                         "train/loss": sum(recent_losses) / len(recent_losses),
                     }
                     progress.set_postfix(avg_metrics)
-                    wandb.log(avg_metrics, step=batch_idx)
+                    # wandb.log(avg_metrics, step=batch_idx)
             
             # Save checkpoint
             if (batch_idx > 0 and 
