@@ -2,6 +2,7 @@
 Complete implementation of GRPO for OpenVLA using binary random rewards.
 Includes full training pipeline with improved generation, reward calculation,
 and training loop optimizations.
+Reference policy and KL divergence removed for simplicity.
 """
 
 import os
@@ -42,21 +43,21 @@ from prismatic.vla.token2action import TokenActionConverter
 
 # Action normalization constants
 min_values = np.array([
-    -0.02872725307941437,
-    -0.04170349963009357,
-    -0.026093858778476715,
-    -0.08092105075716972,
-    -0.09288699507713317,
-    -0.20718276381492615,
+    -0.7454732114076613,
+    -0.6616071462631226,
+    -0.9375,
+    -0.1071428582072258,
+    -0.20678570866584778,
+    -0.1842857152223587,
     0.0
 ])
 max_values = np.array([
-    0.028309678435325586,
-    0.040855254605412394,
-    0.040161586627364146,
-    0.08192047759890528,
-    0.07792850524187081,
-    0.20382574498653397,
+    0.9375,
+    0.8758928775787354,
+    0.9321428537368774,
+    0.1039285734295845,
+    0.17678570747375488,
+    0.14571428298950195,
     1.0
 ])
 ranges = max_values - min_values
@@ -84,7 +85,6 @@ class GRPOVLAConfig:
 
     # GRPO Specific Parameters
     num_generations: int = 8
-    beta: float = 0.04
     temperature: float = 0.9
     max_prompt_length: int = 512
     max_completion_length: int = 512
@@ -141,7 +141,7 @@ def get_per_token_logps(
     
     # ---
     # Find the first occurrence of token 259 in the shifted sequences.
-    # (If you want to search the original generated_ids you’ll need to adjust for the shift.)
+    # (If you want to search the original generated_ids you'll need to adjust for the shift.)
     token_starts = []
     for b in range(batch_size):
         # Find indices in the shifted sequence where the token equals 259.
@@ -278,19 +278,13 @@ def train_step(
     }
     
     # Remove ground truth actions from input
-    # print("in_ids: ", inputs["input_ids"])
-    # print("labels: ", inputs["labels"])
     action_gt = inputs["labels"]
     continuous_gt = converter.token_to_action(inputs["labels"].cpu().numpy())
-    # print(continuous_gt)
 
     # Storage for multiple generations
     all_policy_logps = []
-    all_ref_logps = []
     all_action_preds = []
     all_rewards = []
-    
-    # input_length = inputs["input_ids"].shape[1]
     
     # Generate multiple trajectories
     for _ in range(config.num_generations):
@@ -309,55 +303,26 @@ def train_step(
             model.module.config.pad_token_id
         )
         
-        # Get reference logprobs with LoRA disabled
-        with torch.no_grad():
-            if isinstance(model.module, PeftModel):
-                # Temporarily disable LoRA modules
-                model.module.disable_adapter_layers()
-                ref_logps = get_per_token_logps(
-                    model.module,
-                    generated_ids,
-                    inputs["pixel_values"],
-                    model.module.config.pad_token_id
-                )
-                # Re-enable LoRA modules
-                model.module.enable_adapter_layers()
-            else:
-                # If not using LoRA, reference and policy are the same
-                ref_logps = policy_logps.detach()
-        
-        # actions_pred = generated_ids[:, input_length:]
         continuous_pred = converter.token_to_action(actions_pred.cpu().numpy())
         rewards = calculate_rewards(continuous_gt, continuous_pred, ranges)
         
         all_policy_logps.append(policy_logps)
-        all_ref_logps.append(ref_logps)
         all_action_preds.append(actions_pred)
         all_rewards.append(rewards.to(device_id))
     
     # Stack results
     policy_logps = torch.stack(all_policy_logps, dim=1)
-    ref_logps = torch.stack(all_ref_logps, dim=1)
     action_preds = torch.stack(all_action_preds, dim=1)
     rewards = torch.stack(all_rewards, dim=1)
-
-    # print("action_preds: ", action_preds)
-    # print("policy_logps: ", policy_logps)
-    # print("ref_logps: ", ref_logps)
-
-    # Calculate KL divergence
-    kl_div = torch.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
     
     # Calculate advantages
     advantages = (rewards - rewards.mean(dim=1, keepdim=True))
     advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-8)
     advantages = advantages.unsqueeze(2)
     
-    # Compute GRPO loss
+    # Compute simplified GRPO loss (without KL divergence)
     importance_weights = torch.exp(policy_logps - policy_logps.detach())
-    policy_loss = -importance_weights * advantages
-    total_loss = policy_loss + config.beta * kl_div
-    loss = total_loss.mean()
+    loss = -(importance_weights * advantages).mean()
     
     # Backward pass
     normalized_loss = loss / config.grad_accumulation_steps
@@ -367,7 +332,6 @@ def train_step(
         "loss": loss.item(),
         "reward": rewards.mean().item(),
         "reward_std": rewards.std().item(),
-        "kl": kl_div.mean().item(),
     }
 
 @draccus.wrap()
@@ -387,7 +351,7 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
         f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
         f"+lr-{cfg.learning_rate}"
-        f"+grpo-g{cfg.num_generations}+b{cfg.beta}"
+        f"+grpo-g{cfg.num_generations}"
     )
     if cfg.use_lora:
         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
@@ -506,7 +470,6 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
     recent_rewards = deque(maxlen=cfg.grad_accumulation_steps)
     recent_rewards_std = deque(maxlen=cfg.grad_accumulation_steps)
-    recent_kls = deque(maxlen=cfg.grad_accumulation_steps)
     
     # Training loop
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -529,7 +492,6 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
             recent_losses.append(metrics["loss"])
             recent_rewards_std.append(metrics["reward_std"])
             recent_rewards.append(metrics["reward"])
-            recent_kls.append(metrics["kl"])
             
             # Optimizer step if needed
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
@@ -542,7 +504,6 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                     avg_metrics = {
                         "train/reward": sum(recent_rewards) / len(recent_rewards),
                         "train/reward_std": sum(recent_rewards_std) / len(recent_rewards_std),
-                        "train/kl": sum(recent_kls) / len(recent_kls),
                         "train/loss": sum(recent_losses) / len(recent_losses),
                     }
                     progress.set_postfix(avg_metrics)

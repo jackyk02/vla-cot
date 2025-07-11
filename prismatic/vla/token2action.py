@@ -3,7 +3,7 @@ from transformers import AutoConfig
 
 
 class TokenActionConverter:
-    def __init__(self, n_action_bins: int = 256, unnorm_key: str = "bridge_orig"):
+    def __init__(self, n_action_bins: int = 256, unnorm_key: str = "libero_spatial"):
         self.bins = np.linspace(-1, 1, n_action_bins)
         self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0
         self.vocab_size = 32000
