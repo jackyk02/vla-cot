@@ -1,7 +1,7 @@
 """
 Complete implementation of GRPO for OpenVLA using binary random rewards.
 Includes full training pipeline with improved generation, reward calculation,
-and training loop optimizations.
+training loop optimizations, and comprehensive metrics.
 Reference policy and KL divergence removed for simplicity.
 """
 
@@ -9,7 +9,7 @@ import os
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import draccus
 import torch
@@ -99,6 +99,9 @@ class GRPOVLAConfig:
     wandb_project: str = "openvla"
     wandb_entity: str = "stanford-voltron"
     run_id_note: Optional[str] = None
+    log_every: int = 5
+    eval_every: int = 1000
+    eval_samples: int = 100
 
 def get_per_token_logps(
     model: torch.nn.Module,
@@ -183,6 +186,56 @@ def calculate_rewards(
     rewards = np.exp(-nrmse)
     return torch.tensor(rewards, dtype=torch.float32)
 
+def calculate_action_metrics(
+    action_gt: np.ndarray,
+    action_sampled: np.ndarray,
+    ranges: np.ndarray
+) -> Dict[str, float]:
+    """Calculate comprehensive action prediction metrics."""
+    
+    # Per-dimension errors
+    errors = np.abs(action_gt - action_sampled)
+    normalized_errors = errors / ranges
+    
+    # Mean Absolute Error (MAE) per dimension
+    mae_per_dim = np.mean(errors, axis=0)
+    
+    # Root Mean Square Error (RMSE) per dimension
+    rmse_per_dim = np.sqrt(np.mean(errors**2, axis=0))
+    
+    # Normalized errors
+    nmae = np.mean(normalized_errors)
+    nrmse = np.sqrt(np.mean(normalized_errors**2))
+    
+    # Success metrics (within threshold)
+    success_5_percent = np.mean(np.all(normalized_errors < 0.05, axis=1))
+    success_10_percent = np.mean(np.all(normalized_errors < 0.10, axis=1))
+    success_20_percent = np.mean(np.all(normalized_errors < 0.20, axis=1))
+    
+    # Gripper accuracy (last dimension)
+    gripper_correct = np.mean(
+        (action_gt[:, -1] > 0.5) == (action_sampled[:, -1] > 0.5)
+    )
+    
+    metrics = {
+        "mae": np.mean(mae_per_dim),
+        "rmse": np.mean(rmse_per_dim),
+        "nmae": nmae,
+        "nrmse": nrmse,
+        "success_5_percent": success_5_percent,
+        "success_10_percent": success_10_percent,
+        "success_20_percent": success_20_percent,
+        "gripper_accuracy": gripper_correct,
+    }
+    
+    # Per-dimension metrics
+    dim_names = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+    for i, name in enumerate(dim_names):
+        metrics[f"mae_{name}"] = mae_per_dim[i]
+        metrics[f"rmse_{name}"] = rmse_per_dim[i]
+    
+    return metrics
+
 def remove_padding(batch):
     # Find where the padding tokens (32000) start in input_ids
     non_padding_mask = batch['input_ids'][0] != 32000
@@ -251,14 +304,73 @@ def save_checkpoint(
     model: DDP,
     processor: Any,
     step: int,
-    save_dir: Path
+    save_dir: Path,
+    metrics: Optional[Dict[str, float]] = None
 ) -> None:
-    """Save model checkpoint."""
+    """Save model checkpoint with optional metrics."""
     
     checkpoint_dir = save_dir / f"checkpoint-{step}"
     os.makedirs(checkpoint_dir, exist_ok=True)
     model.module.save_pretrained(checkpoint_dir)
     processor.save_pretrained(checkpoint_dir)
+    
+    # Save metrics if provided
+    if metrics:
+        import json
+        with open(checkpoint_dir / "metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+
+def evaluate(
+    model: DDP,
+    dataloader: DataLoader,
+    action_tokenizer: ActionTokenizer,
+    converter: TokenActionConverter,
+    config: GRPOVLAConfig,
+    device_id: int,
+    num_samples: int = 100
+) -> Dict[str, float]:
+    """Evaluate model performance on a subset of data."""
+    
+    model.eval()
+    all_metrics = []
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= num_samples:
+                break
+                
+            # Process inputs
+            inputs = {
+                k: (v.to(device_id) if isinstance(v, torch.Tensor) else v)
+                for k, v in batch.items() if k != 'dataset_names'
+            }
+            
+            # Get ground truth actions
+            continuous_gt = converter.token_to_action(inputs["labels"].cpu().numpy())
+            
+            # Generate predictions with greedy decoding
+            generated_ids, actions_pred = generate_with_padding(
+                model.module,
+                inputs,
+                model.module.get_action_dim("bridge_orig"),
+                model.module.config.pad_token_id,
+                temperature=0.0  # Greedy decoding for evaluation
+            )
+            
+            # Convert to continuous actions
+            continuous_pred = converter.token_to_action(actions_pred.cpu().numpy())
+            
+            # Calculate metrics
+            metrics = calculate_action_metrics(continuous_gt, continuous_pred, ranges)
+            all_metrics.append(metrics)
+    
+    # Average metrics across batches
+    avg_metrics = {}
+    for key in all_metrics[0].keys():
+        avg_metrics[f"eval/{key}"] = np.mean([m[key] for m in all_metrics])
+    
+    model.train()
+    return avg_metrics
 
 def train_step(
     model: DDP,
@@ -269,7 +381,7 @@ def train_step(
     config: GRPOVLAConfig,
     device_id: int
 ) -> Dict[str, float]:
-    """Execute single GRPO training step."""
+    """Execute single GRPO training step with comprehensive metrics."""
     
     # Process inputs
     inputs = {
@@ -285,6 +397,7 @@ def train_step(
     all_policy_logps = []
     all_action_preds = []
     all_rewards = []
+    all_continuous_preds = []
     
     # Generate multiple trajectories
     for _ in range(config.num_generations):
@@ -309,6 +422,7 @@ def train_step(
         all_policy_logps.append(policy_logps)
         all_action_preds.append(actions_pred)
         all_rewards.append(rewards.to(device_id))
+        all_continuous_preds.append(continuous_pred)
     
     # Stack results
     policy_logps = torch.stack(all_policy_logps, dim=1)
@@ -317,26 +431,85 @@ def train_step(
     
     # Calculate advantages
     advantages = (rewards - rewards.mean(dim=1, keepdim=True))
-    advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-8)
+    advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-4)
     advantages = advantages.unsqueeze(2)
     
     # Compute simplified GRPO loss (without KL divergence)
     importance_weights = torch.exp(policy_logps - policy_logps.detach())
     loss = -(importance_weights * advantages).mean()
     
+    # Calculate additional metrics
+    # Best generation metrics
+    best_indices = rewards.argmax(dim=1)
+    best_continuous_preds = np.stack([
+        all_continuous_preds[i][j] 
+        for j, i in enumerate(best_indices.cpu().numpy())
+    ])
+    best_metrics = calculate_action_metrics(continuous_gt, best_continuous_preds, ranges)
+    
+    # Average generation metrics
+    avg_continuous_preds = np.mean(all_continuous_preds, axis=0)
+    avg_metrics = calculate_action_metrics(continuous_gt, avg_continuous_preds, ranges)
+    
+    # Diversity metrics
+    action_std = np.std(all_continuous_preds, axis=0).mean()
+    
     # Backward pass
     normalized_loss = loss / config.grad_accumulation_steps
     normalized_loss.backward()
     
-    return {
+    metrics = {
         "loss": loss.item(),
-        "reward": rewards.mean().item(),
+        "reward_mean": rewards.mean().item(),
         "reward_std": rewards.std().item(),
+        "reward_max": rewards.max().item(),
+        "reward_min": rewards.min().item(),
+        "importance_weights_mean": importance_weights.mean().item(),
+        "importance_weights_std": importance_weights.std().item(),
+        "advantages_mean": advantages.mean().item(),
+        "advantages_std": advantages.std().item(),
+        "action_diversity": action_std,
+        "best_reward": rewards.max(dim=1)[0].mean().item(),
     }
+    
+    # Add best generation metrics
+    for key, value in best_metrics.items():
+        metrics[f"best_{key}"] = value
+        
+    # Add average generation metrics
+    for key, value in avg_metrics.items():
+        metrics[f"avg_{key}"] = value
+    
+    return metrics
+
+class MetricsTracker:
+    """Track and aggregate training metrics."""
+    
+    def __init__(self, window_size: int = 100):
+        self.window_size = window_size
+        self.metrics = {}
+        
+    def update(self, metrics: Dict[str, float]):
+        """Update metrics with new values."""
+        for key, value in metrics.items():
+            if key not in self.metrics:
+                self.metrics[key] = deque(maxlen=self.window_size)
+            self.metrics[key].append(value)
+    
+    def get_averages(self) -> Dict[str, float]:
+        """Get average values for all tracked metrics."""
+        return {
+            key: sum(values) / len(values) if values else 0.0
+            for key, values in self.metrics.items()
+        }
+    
+    def reset(self):
+        """Reset all metrics."""
+        self.metrics.clear()
 
 @draccus.wrap()
 def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
-    """Main training function for GRPO-VLA."""
+    """Main training function for GRPO-VLA with comprehensive metrics."""
     
     print(f"Training OpenVLA Model `{cfg.vla_path}` with GRPO on `{cfg.dataset_name}`")
     
@@ -466,10 +639,8 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
     trainable_params = [p for p in vla.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
     
-    # Initialize metric tracking
-    recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
-    recent_rewards = deque(maxlen=cfg.grad_accumulation_steps)
-    recent_rewards_std = deque(maxlen=cfg.grad_accumulation_steps)
+    # Initialize metrics tracker
+    metrics_tracker = MetricsTracker(window_size=cfg.grad_accumulation_steps)
     
     # Training loop
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -488,10 +659,8 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                 device_id
             )
             
-            # Store metrics
-            recent_losses.append(metrics["loss"])
-            recent_rewards_std.append(metrics["reward_std"])
-            recent_rewards.append(metrics["reward"])
+            # Update metrics tracker
+            metrics_tracker.update(metrics)
             
             # Optimizer step if needed
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
@@ -499,30 +668,79 @@ def train_grpo_vla(cfg: GRPOVLAConfig) -> None:
                 optimizer.zero_grad()
                 progress.update()
                 
+                # Get averaged metrics
+                avg_metrics = metrics_tracker.get_averages()
+                
                 # Log metrics
-                if distributed_state.is_main_process:
-                    avg_metrics = {
-                        "train/reward": sum(recent_rewards) / len(recent_rewards),
-                        "train/reward_std": sum(recent_rewards_std) / len(recent_rewards_std),
-                        "train/loss": sum(recent_losses) / len(recent_losses),
-                    }
-                    progress.set_postfix(avg_metrics)
-                    wandb.log(avg_metrics, step=batch_idx)
+                if distributed_state.is_main_process and batch_idx % cfg.log_every == 0:
+                    log_metrics = {f"train/{k}": v for k, v in avg_metrics.items()}
+                    progress.set_postfix({
+                        "loss": avg_metrics.get("loss", 0),
+                        "reward": avg_metrics.get("reward_mean", 0),
+                        "best_mae": avg_metrics.get("best_mae", 0)
+                    })
+                    wandb.log(log_metrics, step=batch_idx)
+            
+            # Evaluation
+            if (batch_idx > 0 and 
+                batch_idx % cfg.eval_every == 0 and 
+                distributed_state.is_main_process):
+                eval_metrics = evaluate(
+                    vla,
+                    dataloader,
+                    action_tokenizer,
+                    converter,
+                    cfg,
+                    device_id,
+                    num_samples=cfg.eval_samples
+                )
+                wandb.log(eval_metrics, step=batch_idx)
+                print(f"\nEvaluation at step {batch_idx}:")
+                for key, value in eval_metrics.items():
+                    print(f"  {key}: {value:.4f}")
             
             # Save checkpoint
             if (batch_idx > 0 and 
                 batch_idx % cfg.save_steps == 0 and 
                 distributed_state.is_main_process):
+                current_metrics = metrics_tracker.get_averages()
                 save_checkpoint(
                     vla,
                     processor,
                     batch_idx,
-                    adapter_dir if cfg.use_lora else run_dir
+                    adapter_dir if cfg.use_lora else run_dir,
+                    metrics=current_metrics
                 )
             
             # Check for max steps
             if batch_idx >= cfg.max_steps:
                 break
+    
+    # Final evaluation
+    if distributed_state.is_main_process:
+        print("\nRunning final evaluation...")
+        final_eval_metrics = evaluate(
+            vla,
+            dataloader,
+            action_tokenizer,
+            converter,
+            cfg,
+            device_id,
+            num_samples=cfg.eval_samples * 2  # More samples for final eval
+        )
+        wandb.log(final_eval_metrics, step=cfg.max_steps)
+        print("\nFinal evaluation results:")
+        for key, value in final_eval_metrics.items():
+            print(f"  {key}: {value:.4f}")
+        
+        # Save final checkpoint with metrics
+        save_checkpoint(
+            vla,
+            processor,
+            cfg.max_steps,
+            adapter_dir if cfg.use_lora else run_dir,
+            metrics=final_eval_metrics
+        )
     
     print(f"Training completed! Model saved to {run_dir}")
 
