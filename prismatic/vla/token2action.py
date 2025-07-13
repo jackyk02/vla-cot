@@ -9,7 +9,7 @@ class TokenActionConverter:
         self.vocab_size = 32000
         self.unnorm_key = unnorm_key
         self.config = AutoConfig.from_pretrained(
-            "openvla/openvla-7b-finetuned-libero-10", trust_remote_code=True
+            "openvla/openvla-7b-finetuned-libero-spatial", trust_remote_code=True
         ).to_dict()
         self.norm_stats = self.config["norm_stats"]
         assert unnorm_key is not None
